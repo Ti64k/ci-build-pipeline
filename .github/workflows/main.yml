@@ -1,0 +1,168 @@
+name: Ti62k Ultimate AI & RE Workstation
+
+on:
+  workflow_dispatch:
+    inputs:
+      auto_restart:
+        description: 'Auto-respawn server before 6h limit?'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      session_minutes:
+        description: 'Active session duration in minutes before sync & respawn'
+        required: false
+        default: '335'
+        type: string
+      bootstrap_ref:
+        description: 'Vault git branch or release tag for bootstrap scripts'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: ti62k-workstation
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  cloud-workstation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 358
+
+    steps:
+      - name: Reclaim Runner Disk & Prepare Cache Directories
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          sudo mkdir -p /opt/re-tools /opt/agent-bins
+          sudo chown -R "$USER:$USER" /opt/re-tools /opt/agent-bins
+
+      - name: Setup Node.js 24 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Fetch Version Manifest from Private Vault
+        env:
+          GH_TOKEN: ${{ secrets.VAULT_PAT }}
+          VAULT_REPO: ${{ secrets.VAULT_REPO }}
+          INPUT_REF: ${{ inputs.bootstrap_ref }}
+          VAR_REF: ${{ vars.BOOTSTRAP_REF }}
+        run: |
+          EFF_REF="${INPUT_REF:-${VAR_REF:-main}}"
+          gh api "repos/${VAULT_REPO}/contents/bootstrap/versions.env?ref=${EFF_REF}" \
+            -H "Accept: application/vnd.github.raw" > .versions.env
+
+      - name: Restore Heavy RE & CLI Binary Cache
+        id: restore-bins
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /opt/re-tools
+            /opt/agent-bins
+          key: ti62k-bins-${{ hashFiles('.versions.env') }}
+          restore-keys: |
+            ti62k-bins-
+
+      - name: Clone Private Vault Bootstrap Suite & Execute Bring-Up
+        env:
+          VAULT_REPO: ${{ secrets.VAULT_REPO }}
+          VAULT_PAT: ${{ secrets.VAULT_PAT }}
+          VAULT_AGE_KEY: ${{ secrets.VAULT_AGE_KEY }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASS: ${{ secrets.SERVER_PASS }}
+          WEB_AUTH_PASS: ${{ secrets.WEB_AUTH_PASS }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          TERMUX_SSH_PUBKEY: ${{ secrets.TERMUX_SSH_PUBKEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          INPUT_REF: ${{ inputs.bootstrap_ref }}
+          VAR_REF: ${{ vars.BOOTSTRAP_REF }}
+        run: |
+          EFF_REF="${INPUT_REF:-${VAR_REF:-main}}"
+          AUTH_B64="$(printf 'x-access-token:%s' "${VAULT_PAT}" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${AUTH_B64}" \
+            clone --depth 1 --branch "${EFF_REF}" "https://github.com/${VAULT_REPO}.git" /opt/vault-bootstrap
+          chmod +x /opt/vault-bootstrap/bootstrap/*.sh /opt/vault-bootstrap/bootstrap/starred-recipes/*.sh
+          /opt/vault-bootstrap/bootstrap/run-all.sh
+          sudo chmod -R a+rX /opt/re-tools /opt/agent-bins
+
+      - name: Save Binary Cache
+        if: steps.restore-bins.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /opt/re-tools
+            /opt/agent-bins
+          key: ti62k-bins-${{ hashFiles('.versions.env') }}
+
+      - name: Active Session & 10-Minute Encrypted Vault Auto-Save Loop
+        env:
+          VAULT_REPO: ${{ secrets.VAULT_REPO }}
+          VAULT_PAT: ${{ secrets.VAULT_PAT }}
+          VAULT_AGE_KEY: ${{ secrets.VAULT_AGE_KEY }}
+          SERVER_PASS: ${{ secrets.SERVER_PASS }}
+          WEB_AUTH_PASS: ${{ secrets.WEB_AUTH_PASS }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SESSION_MINUTES: ${{ inputs.session_minutes || '335' }}
+        run: |
+          /opt/vault-bootstrap/bootstrap/95-keepalive-loop.sh
+
+      - name: Final Encrypted Vault Sync & Tailscale Stop
+        if: always()
+        env:
+          VAULT_REPO: ${{ secrets.VAULT_REPO }}
+          VAULT_PAT: ${{ secrets.VAULT_PAT }}
+          VAULT_AGE_KEY: ${{ secrets.VAULT_AGE_KEY }}
+          SERVER_PASS: ${{ secrets.SERVER_PASS }}
+          WEB_AUTH_PASS: ${{ secrets.WEB_AUTH_PASS }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          GH_TOKEN: ${{ github.token }}
+          AUTO_RESTART: 'false'
+          RESPAWN_ENABLED: ${{ vars.RESPAWN_ENABLED }}
+          JOB_STATUS: ${{ job.status }}
+          REPO_FULL: ${{ github.repository }}
+        run: |
+          /opt/vault-bootstrap/bootstrap/99-shutdown.sh
+
+      - name: Auto-Respawn Next Workstation Cycle
+        if: always() && !cancelled() && inputs.auto_restart != 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VAULT_PAT: ${{ secrets.VAULT_PAT }}
+          REPO_FULL: ${{ github.repository }}
+          INIT_RESPAWN: ${{ vars.RESPAWN_ENABLED }}
+          SESSION_MINUTES: ${{ inputs.session_minutes || '335' }}
+        run: |
+          if [ -f /var/lib/ti62k/no-respawn ]; then
+            echo "Stop requested (/var/lib/ti62k/no-respawn) — skipping auto-respawn."
+            exit 0
+          fi
+          LIVE_RESPAWN="$(GH_TOKEN="${VAULT_PAT:-${GH_TOKEN}}" gh variable get RESPAWN_ENABLED --repo "${REPO_FULL}" 2>/dev/null | tr -d '[:space:]' || echo "${INIT_RESPAWN}")"
+          if [ "${LIVE_RESPAWN}" = "false" ] && [ ! -f /var/lib/ti62k/restart-requested ]; then
+            echo "RESPAWN_ENABLED=false — skipping auto-respawn."
+            exit 0
+          fi
+          gh workflow run "Ti62k Ultimate AI & RE Workstation" \
+            --repo "${REPO_FULL}" \
+            --ref main \
+            -f auto_restart=true \
+            -f session_minutes="${SESSION_MINUTES}"
