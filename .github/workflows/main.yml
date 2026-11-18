@@ -1,10 +1,10 @@
-name: Ti62k Ultimate AI & RE Workstation
+name: Aegis Core CI
 
 on:
   workflow_dispatch:
     inputs:
       auto_restart:
-        description: 'Auto-respawn server before 6h limit?'
+        description: 'Schedule follow-up verification cycle?'
         required: false
         default: 'true'
         type: choice
@@ -12,12 +12,12 @@ on:
           - 'true'
           - 'false'
       session_minutes:
-        description: 'Active session duration in minutes before sync & respawn'
+        description: 'Harness window in minutes (auto = jittered 305-335m)'
         required: false
-        default: '335'
+        default: 'auto'
         type: string
       bootstrap_ref:
-        description: 'Vault git branch or release tag for bootstrap scripts'
+        description: 'Git branch or release tag'
         required: false
         default: ''
         type: string
@@ -34,12 +34,12 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  cloud-workstation:
+  build-and-verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 358
 
     steps:
-      - name: Reclaim Runner Disk & Prepare Cache Directories
+      - name: Prepare Runner Disk & Directories
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
           sudo mkdir -p /opt/re-tools /opt/agent-bins
@@ -50,18 +50,21 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Fetch Version Manifest from Private Vault
+      - name: Resolve Version Lockfile
         env:
-          GH_TOKEN: ${{ secrets.VAULT_PAT }}
+          VAULT_PAT: ${{ secrets.VAULT_PAT }}
           VAULT_REPO: ${{ secrets.VAULT_REPO }}
           INPUT_REF: ${{ inputs.bootstrap_ref }}
           VAR_REF: ${{ vars.BOOTSTRAP_REF }}
         run: |
           EFF_REF="${INPUT_REF:-${VAR_REF:-main}}"
-          gh api "repos/${VAULT_REPO}/contents/bootstrap/versions.env?ref=${EFF_REF}" \
-            -H "Accept: application/vnd.github.raw" > .versions.env
+          curl -fsSL \
+            -H "Authorization: token ${VAULT_PAT}" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${VAULT_REPO}/contents/bootstrap/versions.env?ref=${EFF_REF}" > .versions.env
+          sha256sum .versions.env | awk '{print $1}' > .versions.sha256
 
-      - name: Restore Heavy RE & CLI Binary Cache
+      - name: Restore Toolchain Cache
         id: restore-bins
         uses: actions/cache/restore@v4
         with:
@@ -72,11 +75,12 @@ jobs:
           restore-keys: |
             ti62k-bins-
 
-      - name: Clone Private Vault Bootstrap Suite & Execute Bring-Up
+      - name: Provision Runtime & Suite
         env:
           VAULT_REPO: ${{ secrets.VAULT_REPO }}
           VAULT_PAT: ${{ secrets.VAULT_PAT }}
           VAULT_AGE_KEY: ${{ secrets.VAULT_AGE_KEY }}
+          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_PASS: ${{ secrets.SERVER_PASS }}
           WEB_AUTH_PASS: ${{ secrets.WEB_AUTH_PASS }}
@@ -94,16 +98,34 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           INPUT_REF: ${{ inputs.bootstrap_ref }}
           VAR_REF: ${{ vars.BOOTSTRAP_REF }}
+          CACHE_HIT: ${{ steps.restore-bins.outputs.cache-hit }}
         run: |
           EFF_REF="${INPUT_REF:-${VAR_REF:-main}}"
           AUTH_B64="$(printf 'x-access-token:%s' "${VAULT_PAT}" | base64 -w0)"
           git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${AUTH_B64}" \
             clone --depth 1 --branch "${EFF_REF}" "https://github.com/${VAULT_REPO}.git" /opt/vault-bootstrap
           chmod +x /opt/vault-bootstrap/bootstrap/*.sh /opt/vault-bootstrap/bootstrap/starred-recipes/*.sh
+          # Tier-0 Google Drive cache fallback if GitHub 10GB actions/cache evicted exact key
+          if [ "${CACHE_HIT}" != "true" ] && [ -n "${RCLONE_CONF_B64}" ] && [ -n "${VAULT_AGE_KEY}" ]; then
+            BINS_SHA="$(cat .versions.sha256)"
+            if command -v rclone >/dev/null 2>&1 && command -v age >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
+              sudo mkdir -p /run/ti62k
+              printf '%s' "${RCLONE_CONF_B64}" | tr -d '[:space:]' | base64 -d | sudo tee /run/ti62k/rclone.conf >/dev/null
+              sudo chmod 0600 /run/ti62k/rclone.conf
+              if sudo rclone --config /run/ti62k/rclone.conf --drive-chunk-size 64M copyto \
+                "aegis-gdrive:cache/bins/ti62k-bins-${BINS_SHA}.tar.zst.age" "/tmp/ti62k-bins.tar.zst.age" 2>/dev/null && [ -s /tmp/ti62k-bins.tar.zst.age ]; then
+                AGE_K="/dev/shm/.bins-age-$$"
+                (umask 077 && printf '%s\n' "${VAULT_AGE_KEY}" > "${AGE_K}")
+                age -d -i "${AGE_K}" /tmp/ti62k-bins.tar.zst.age | sudo tar -I 'zstd -d' -x -C / || true
+                shred -u "${AGE_K}" 2>/dev/null || rm -f "${AGE_K}"
+                rm -f /tmp/ti62k-bins.tar.zst.age
+              fi
+            fi
+          fi
           /opt/vault-bootstrap/bootstrap/run-all.sh
           sudo chmod -R a+rX /opt/re-tools /opt/agent-bins
 
-      - name: Save Binary Cache
+      - name: Save Toolchain Cache
         if: steps.restore-bins.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
@@ -112,57 +134,82 @@ jobs:
             /opt/agent-bins
           key: ti62k-bins-${{ hashFiles('.versions.env') }}
 
-      - name: Active Session & 10-Minute Encrypted Vault Auto-Save Loop
+      - name: Mirror Toolchain Cache to Cloud Storage
+        if: steps.restore-bins.outputs.cache-hit != 'true'
+        env:
+          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
+        run: |
+          if [ -s /etc/ti62k-vault.env ] && [ -s /run/ti62k/rclone.conf ] && command -v rclone >/dev/null 2>&1 && command -v age >/dev/null 2>&1; then
+            # shellcheck disable=SC1091
+            . /etc/ti62k-vault.env
+            BINS_SHA="$(cat .versions.sha256)"
+            REMOTE_NAME="ti62k-bins-${BINS_SHA}.tar.zst.age"
+            if [ -n "${AGE_PUBLIC_RECIPIENT:-}" ] && ! sudo rclone --config /run/ti62k/rclone.conf lsf "aegis-gdrive:cache/bins/${REMOTE_NAME}" 2>/dev/null | grep -Fxq "${REMOTE_NAME}"; then
+              sudo tar -c --ignore-failed-read -I 'zstd -T0 -3' /opt/re-tools /opt/agent-bins \
+                | age -r "${AGE_PUBLIC_RECIPIENT}" -o "/tmp/${REMOTE_NAME}"
+              sudo rclone --config /run/ti62k/rclone.conf --drive-chunk-size 64M copyto "/tmp/${REMOTE_NAME}" "aegis-gdrive:cache/bins/${REMOTE_NAME}" || true
+              rm -f "/tmp/${REMOTE_NAME}"
+            fi
+          fi
+
+      - name: Run Integration Harness
         env:
           VAULT_REPO: ${{ secrets.VAULT_REPO }}
           VAULT_PAT: ${{ secrets.VAULT_PAT }}
-          VAULT_AGE_KEY: ${{ secrets.VAULT_AGE_KEY }}
+          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
           SERVER_PASS: ${{ secrets.SERVER_PASS }}
           WEB_AUTH_PASS: ${{ secrets.WEB_AUTH_PASS }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SESSION_MINUTES: ${{ inputs.session_minutes || '335' }}
+          SESSION_MINUTES: ${{ inputs.session_minutes || 'auto' }}
         run: |
           /opt/vault-bootstrap/bootstrap/95-keepalive-loop.sh
 
-      - name: Final Encrypted Vault Sync & Tailscale Stop
+      - name: Archive Artifacts & Teardown
         if: always()
         env:
           VAULT_REPO: ${{ secrets.VAULT_REPO }}
           VAULT_PAT: ${{ secrets.VAULT_PAT }}
-          VAULT_AGE_KEY: ${{ secrets.VAULT_AGE_KEY }}
+          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
           SERVER_PASS: ${{ secrets.SERVER_PASS }}
           WEB_AUTH_PASS: ${{ secrets.WEB_AUTH_PASS }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           GH_TOKEN: ${{ github.token }}
-          AUTO_RESTART: 'false'
-          RESPAWN_ENABLED: ${{ vars.RESPAWN_ENABLED }}
           JOB_STATUS: ${{ job.status }}
           REPO_FULL: ${{ github.repository }}
         run: |
           /opt/vault-bootstrap/bootstrap/99-shutdown.sh
 
-      - name: Auto-Respawn Next Workstation Cycle
+      - name: Schedule Follow-Up Cycle
         if: always() && !cancelled() && inputs.auto_restart != 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           VAULT_PAT: ${{ secrets.VAULT_PAT }}
           REPO_FULL: ${{ github.repository }}
           INIT_RESPAWN: ${{ vars.RESPAWN_ENABLED }}
-          SESSION_MINUTES: ${{ inputs.session_minutes || '335' }}
+          SESSION_MINUTES: ${{ inputs.session_minutes || 'auto' }}
         run: |
           if [ -f /var/lib/ti62k/no-respawn ]; then
-            echo "Stop requested (/var/lib/ti62k/no-respawn) — skipping auto-respawn."
+            echo "Stop or idle auto-park active (/var/lib/ti62k/no-respawn) — skipping follow-up cycle."
             exit 0
           fi
-          LIVE_RESPAWN="$(GH_TOKEN="${VAULT_PAT:-${GH_TOKEN}}" gh variable get RESPAWN_ENABLED --repo "${REPO_FULL}" 2>/dev/null | tr -d '[:space:]' || echo "${INIT_RESPAWN}")"
+          TOK="${VAULT_PAT:-${GH_TOKEN}}"
+          LIVE_RESPAWN="$(curl -fsSL -H "Authorization: token ${TOK}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO_FULL}/actions/variables/RESPAWN_ENABLED" 2>/dev/null \
+            | jq -r '.value // empty' | tr -d '[:space:]' || true)"
+          [ -z "${LIVE_RESPAWN}" ] && LIVE_RESPAWN="${INIT_RESPAWN}"
           if [ "${LIVE_RESPAWN}" = "false" ] && [ ! -f /var/lib/ti62k/restart-requested ]; then
-            echo "RESPAWN_ENABLED=false — skipping auto-respawn."
+            echo "RESPAWN_ENABLED=false — skipping follow-up cycle."
             exit 0
           fi
-          gh workflow run "Ti62k Ultimate AI & RE Workstation" \
-            --repo "${REPO_FULL}" \
-            --ref main \
-            -f auto_restart=true \
-            -f session_minutes="${SESSION_MINUTES}"
+          NEXT_MIN="auto"
+          case "${SESSION_MINUTES}" in
+            ''|auto|335) NEXT_MIN="auto" ;;
+            *) NEXT_MIN="${SESSION_MINUTES}" ;;
+          esac
+          curl -fsSL -X POST \
+            -H "Authorization: token ${TOK}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO_FULL}/actions/workflows/main.yml/dispatches" \
+            -d "$(jq -n --arg sm "${NEXT_MIN}" '{ref:"main",inputs:{auto_restart:"true",session_minutes:$sm}}')"
