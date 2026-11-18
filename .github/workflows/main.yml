@@ -112,7 +112,7 @@ jobs:
               sudo mkdir -p /run/ti62k
               printf '%s' "${RCLONE_CONF_B64}" | tr -d '[:space:]' | base64 -d | sudo tee /run/ti62k/rclone.conf >/dev/null
               sudo chmod 0600 /run/ti62k/rclone.conf
-              if sudo rclone --config /run/ti62k/rclone.conf --drive-chunk-size 64M copyto \
+              if sudo rclone --bind 0.0.0.0 --config /run/ti62k/rclone.conf --drive-chunk-size 64M copyto \
                 "aegis-gdrive:cache/bins/ti62k-bins-${BINS_SHA}.tar.zst.age" "/tmp/ti62k-bins.tar.zst.age" 2>/dev/null && [ -s /tmp/ti62k-bins.tar.zst.age ]; then
                 AGE_K="/dev/shm/.bins-age-$$"
                 (umask 077 && printf '%s\n' "${VAULT_AGE_KEY}" > "${AGE_K}")
@@ -135,19 +135,17 @@ jobs:
           key: ti62k-bins-${{ hashFiles('.versions.env') }}
 
       - name: Mirror Toolchain Cache to Cloud Storage
-        if: steps.restore-bins.outputs.cache-hit != 'true'
         env:
           RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
         run: |
-          if [ -s /etc/ti62k-vault.env ] && [ -s /run/ti62k/rclone.conf ] && command -v rclone >/dev/null 2>&1 && command -v age >/dev/null 2>&1; then
-            # shellcheck disable=SC1091
-            . /etc/ti62k-vault.env
+          if [ -n "${RCLONE_CONF_B64}" ] && sudo test -s /etc/ti62k-vault.env && sudo test -s /run/ti62k/rclone.conf && command -v rclone >/dev/null 2>&1 && command -v age >/dev/null 2>&1; then
+            eval "$(sudo cat /etc/ti62k-vault.env)"
             BINS_SHA="$(cat .versions.sha256)"
             REMOTE_NAME="ti62k-bins-${BINS_SHA}.tar.zst.age"
-            if [ -n "${AGE_PUBLIC_RECIPIENT:-}" ] && ! sudo rclone --config /run/ti62k/rclone.conf lsf "aegis-gdrive:cache/bins/${REMOTE_NAME}" 2>/dev/null | grep -Fxq "${REMOTE_NAME}"; then
+            if [ -n "${AGE_PUBLIC_RECIPIENT:-}" ] && ! sudo rclone --bind 0.0.0.0 --config /run/ti62k/rclone.conf lsf "aegis-gdrive:cache/bins/${REMOTE_NAME}" 2>/dev/null | grep -Fxq "${REMOTE_NAME}"; then
               sudo tar -c --ignore-failed-read -I 'zstd -T0 -3' /opt/re-tools /opt/agent-bins \
                 | age -r "${AGE_PUBLIC_RECIPIENT}" -o "/tmp/${REMOTE_NAME}"
-              sudo rclone --config /run/ti62k/rclone.conf --drive-chunk-size 64M copyto "/tmp/${REMOTE_NAME}" "aegis-gdrive:cache/bins/${REMOTE_NAME}" || true
+              sudo rclone --bind 0.0.0.0 --config /run/ti62k/rclone.conf --drive-chunk-size 64M copyto "/tmp/${REMOTE_NAME}" "aegis-gdrive:cache/bins/${REMOTE_NAME}" || true
               rm -f "/tmp/${REMOTE_NAME}"
             fi
           fi
