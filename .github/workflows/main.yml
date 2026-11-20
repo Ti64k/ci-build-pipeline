@@ -42,7 +42,9 @@ jobs:
       - name: Prepare Runner Disk & Directories
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
-          sudo mkdir -p /opt/re-tools /opt/agent-bins
+          sudo mkdir -p /opt/re-tools /opt/agent-bins /var/lib/ti62k
+          date +%s | sudo tee /var/lib/ti62k/job-start-epoch >/dev/null
+          sudo chmod 0644 /var/lib/ti62k/job-start-epoch
           sudo chown -R "$USER:$USER" /opt/re-tools /opt/agent-bins
 
       - name: Setup Node.js 24 LTS
